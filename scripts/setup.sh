@@ -94,7 +94,7 @@ function setup_reboot {
             sudo modprobe br_netfilter
             sudo sysctl --system
             sudo usermod -aG docker $USER
-            sudo systemctl restart docker.serive docker.socket
+            sudo systemctl restart docker.service docker.socket
             sudo setfacl -m "user:$USER:rw" /var/run/docker.sock
 EOF
     done

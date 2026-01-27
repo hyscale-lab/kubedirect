@@ -135,9 +135,8 @@ EOF
 
     sudo apt-get install -y python3-pip
     python3 -m pip install --upgrade pip
-    pip3 install numpy scipy
     pip3 install --upgrade pyyaml
-    pip3 install parse numpy matplotlib
+    pip3 install parse numpy matplotlib scipy pandas
 
     sudo apt-get install -y git-lfs
     git lfs install

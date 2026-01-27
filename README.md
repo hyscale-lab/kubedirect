@@ -21,7 +21,9 @@ Our experiments are conducted on CloudLab xl170 nodes with Ubuntu 22.04. We have
 If you wish to set up your own cluster, please refer to the [CloudLab manual](https://www.cloudlab.us/).
 ***Reviewers using the reserved cluster can skip the following steps***.
 
-After setting up the cluster, clone the repository with
+After setting up the cluster, you will have to upload your ssh private key, i.e., the one that matches your registered public key on CloudLab, to your master node as `~/.ssh/id_rsa`. This is how we the configures the cluster in a centralized manner from the master node.
+
+Next, on the master node, clone the repository with
 
 ```bash
 git clone --recursive https://github.com/TomQuartz/kubedirect-ae.git
@@ -33,7 +35,7 @@ then run
 ./scripts/setup.sh
 ```
 
-on the **master** node to install necessary dependencies and set up SSH across all nodes.
+to install necessary dependencies and set up SSH across all nodes.
 Restart the terminal session after running the script.
 
 
