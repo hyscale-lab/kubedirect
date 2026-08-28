@@ -125,6 +125,9 @@ require (
 )
 
 replace (
+	// v1.1.2 is retained for compatibility with the pinned Firecracker API,
+	// with its response envelope patched for modern google.rpc.Status types.
+	github.com/containerd/ttrpc => ./third_party/ttrpc
 	github.com/firecracker-microvm/firecracker-containerd => github.com/vhive-serverless/firecracker-containerd v0.0.0-20260304152437-f7f97e2dec10
 	github.com/vhive-serverless/loader => ./invitro
 	github.com/vhive-serverless/vhive/examples/protobuf/helloworld => github.com/vhive-serverless/vhive/examples/protobuf/helloworld v0.0.0-20260821031610-439f855d1166

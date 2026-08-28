@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,6 +19,23 @@ type fakeVMManager struct {
 	env    []string
 	args   []string
 }
+
+type blockingVMManager struct {
+	started chan context.Context
+	release chan struct{}
+}
+
+func (m *blockingVMManager) Start(ctx context.Context, _ string, _, _ []string) (vmInstance, error) {
+	m.started <- ctx
+	select {
+	case <-ctx.Done():
+		return vmInstance{}, ctx.Err()
+	case <-m.release:
+		return vmInstance{ID: "vm-1", GuestIP: "172.18.0.2"}, nil
+	}
+}
+
+func (*blockingVMManager) Stop(context.Context, string) error { return nil }
 
 func (m *fakeVMManager) Start(_ context.Context, image string, env, args []string) (vmInstance, error) {
 	m.starts++
@@ -97,6 +115,36 @@ func TestPodVMRuntimeLifecycle(t *testing.T) {
 	}
 	if manager.stops != 1 || redirector.removes != 1 {
 		t.Fatalf("stops=%d redirect removals=%d, want one each", manager.stops, redirector.removes)
+	}
+}
+
+func TestPodVMCreationOutlivesBindRequestDeadline(t *testing.T) {
+	manager := &blockingVMManager{
+		started: make(chan context.Context, 1),
+		release: make(chan struct{}),
+	}
+	runtime := newPodVMRuntime(manager, &fakeRedirector{})
+	if err := runtime.configurePodCIDR("10.244.17.0/24"); err != nil {
+		t.Fatal(err)
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := runtime.ensure(requestCtx, "default/pod-a", supportedPod("pod-a"))
+		result <- err
+	}()
+	operationCtx := <-manager.started
+	cancel()
+
+	select {
+	case <-operationCtx.Done():
+		t.Fatal("VM operation inherited cancellation from the BindPod request")
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(manager.release)
+	if err := <-result; err != nil {
+		t.Fatalf("VM creation failed after BindPod request cancellation: %v", err)
 	}
 }
 

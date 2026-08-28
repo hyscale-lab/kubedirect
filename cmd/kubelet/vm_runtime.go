@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +23,7 @@ const (
 	vhiveFunctionImage       = "ghcr.io/leokondrashov/invitro_trace_function_firecracker:esgz"
 	podServingPort           = 8013
 	defaultFunctionPort      = 80
+	vmCreationTimeout        = 2 * time.Minute
 )
 
 type vmInstance struct {
@@ -45,13 +47,14 @@ type podRedirector interface {
 }
 
 type podVMEntry struct {
-	done        chan struct{}
-	creating    bool
-	removing    bool
-	podIP       netip.Addr
-	instance    vmInstance
-	ruleRemoved bool
-	vmStopped   bool
+	done           chan struct{}
+	creationCancel context.CancelFunc
+	creating       bool
+	removing       bool
+	podIP          netip.Addr
+	instance       vmInstance
+	ruleRemoved    bool
+	vmStopped      bool
 }
 
 // podVMRuntime owns the portion of the Node PodCIDR reserved for the custom
@@ -149,21 +152,33 @@ func (r *podVMRuntime) ensure(ctx context.Context, key string, pod *corev1.Pod) 
 			r.mu.Unlock()
 			return netip.Addr{}, err
 		}
-		entry := &podVMEntry{done: make(chan struct{}), creating: true, podIP: podIP}
+		// Scheduler BindPod calls historically have a one-second deadline, which
+		// is shorter than a Firecracker boot. Once this goroutine owns creation,
+		// keep it alive across transport retries. Pod deletion still cancels it
+		// explicitly through creationCancel.
+		operationCtx, operationCancel := context.WithTimeout(context.WithoutCancel(ctx), vmCreationTimeout)
+		entry := &podVMEntry{
+			done:           make(chan struct{}),
+			creationCancel: operationCancel,
+			creating:       true,
+			podIP:          podIP,
+		}
 		r.entries[key] = entry
 		r.mu.Unlock()
 
-		instance, startErr := r.manager.Start(ctx, spec.image, spec.environment, spec.args)
+		instance, startErr := r.manager.Start(operationCtx, spec.image, spec.environment, spec.args)
 		if startErr == nil {
 			instance.Port = spec.port
-			startErr = r.redirector.Add(ctx, podIP, instance.endpoint())
+			startErr = r.redirector.Add(operationCtx, podIP, instance.endpoint())
 			if startErr != nil {
 				startErr = errors.Join(startErr, r.manager.Stop(context.Background(), instance.ID))
 			}
 		}
+		operationCancel()
 
 		r.mu.Lock()
 		entry.creating = false
+		entry.creationCancel = nil
 		entry.instance = instance
 		if startErr != nil {
 			delete(r.entries, key)
@@ -189,7 +204,21 @@ func (r *podVMRuntime) remove(ctx context.Context, key string) error {
 			r.mu.Unlock()
 			return nil
 		}
-		if entry.creating || entry.removing {
+		if entry.creating {
+			done := entry.done
+			cancel := entry.creationCancel
+			r.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-done:
+			}
+			continue
+		}
+		if entry.removing {
 			done := entry.done
 			r.mu.Unlock()
 			select {

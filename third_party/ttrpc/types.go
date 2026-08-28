@@ -1,0 +1,99 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package ttrpc
+
+import (
+	"fmt"
+
+	gogorpc "github.com/gogo/googleapis/google/rpc"
+	gotypes "github.com/gogo/protobuf/types"
+	spb "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/protobuf/types/known/anypb"
+)
+
+type Request struct {
+	Service     string      `protobuf:"bytes,1,opt,name=service,proto3"`
+	Method      string      `protobuf:"bytes,2,opt,name=method,proto3"`
+	Payload     []byte      `protobuf:"bytes,3,opt,name=payload,proto3"`
+	TimeoutNano int64       `protobuf:"varint,4,opt,name=timeout_nano,proto3"`
+	Metadata    []*KeyValue `protobuf:"bytes,5,rep,name=metadata,proto3"`
+}
+
+func (r *Request) Reset()         { *r = Request{} }
+func (r *Request) String() string { return fmt.Sprintf("%+#v", r) }
+func (r *Request) ProtoMessage()  {}
+
+type Response struct {
+	// Keep the wire envelope entirely on gogo protobuf. Newer releases of
+	// google.rpc.Status contain protoimpl bookkeeping fields, and gogo's table
+	// decoder panics while reflecting those fields (containerd/ttrpc#62).
+	Status  *gogorpc.Status `protobuf:"bytes,1,opt,name=status,proto3"`
+	Payload []byte          `protobuf:"bytes,2,opt,name=payload,proto3"`
+}
+
+func (r *Response) Reset()         { *r = Response{} }
+func (r *Response) String() string { return fmt.Sprintf("%+#v", r) }
+func (r *Response) ProtoMessage()  {}
+
+func statusToWire(status *spb.Status) *gogorpc.Status {
+	if status == nil {
+		return nil
+	}
+	details := make([]*gotypes.Any, 0, len(status.Details))
+	for _, detail := range status.Details {
+		if detail == nil {
+			details = append(details, nil)
+			continue
+		}
+		details = append(details, &gotypes.Any{TypeUrl: detail.TypeUrl, Value: detail.Value})
+	}
+	return &gogorpc.Status{Code: status.Code, Message: status.Message, Details: details}
+}
+
+func statusFromWire(status *gogorpc.Status) *spb.Status {
+	if status == nil {
+		return nil
+	}
+	details := make([]*anypb.Any, 0, len(status.Details))
+	for _, detail := range status.Details {
+		if detail == nil {
+			details = append(details, nil)
+			continue
+		}
+		details = append(details, &anypb.Any{TypeUrl: detail.TypeUrl, Value: detail.Value})
+	}
+	return &spb.Status{Code: status.Code, Message: status.Message, Details: details}
+}
+
+type StringList struct {
+	List []string `protobuf:"bytes,1,rep,name=list,proto3"`
+}
+
+func (r *StringList) Reset()         { *r = StringList{} }
+func (r *StringList) String() string { return fmt.Sprintf("%+#v", r) }
+func (r *StringList) ProtoMessage()  {}
+
+func makeStringList(item ...string) StringList { return StringList{List: item} }
+
+type KeyValue struct {
+	Key   string `protobuf:"bytes,1,opt,name=key,proto3"`
+	Value string `protobuf:"bytes,2,opt,name=value,proto3"`
+}
+
+func (m *KeyValue) Reset()         { *m = KeyValue{} }
+func (*KeyValue) ProtoMessage()    {}
+func (m *KeyValue) String() string { return fmt.Sprintf("%+#v", m) }
