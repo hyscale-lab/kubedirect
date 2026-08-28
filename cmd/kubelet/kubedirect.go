@@ -77,7 +77,7 @@ func (s *KubedirectServer) Handshake(ctx context.Context, req *kdproto.Handshake
 func (s *KubedirectServer) BindPod(ctx context.Context, req *kdproto.PodBindingRequest) (*emptypb.Empty, error) {
 	kdLogger := kdutil.NewLogger(klog.FromContext(ctx)).WithHeader(req.Source + "->BindPod")
 	// get unnamed pod template
-	template, err := kdutil.GetUnnamedTemplateFor(ctx, s.podLister, req.PodInfo.Owner.Namespace, req.PodInfo.Owner.Name, false)
+	template, err := kdutil.GetUnnamedTemplateFor(ctx, s.podLister, req.PodInfo.Owner.Namespace, req.PodInfo.Owner.Name, true)
 	// err is probably due to:
 	// 1. the template pod was deleted, which means the rs is also deleted
 	// 2. the template pod is not yet added to the informer cache
@@ -85,6 +85,11 @@ func (s *KubedirectServer) BindPod(ctx context.Context, req *kdproto.PodBindingR
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.NotFound,
 			"error getting template pod for %s/%s: %v", req.PodInfo.Owner.Namespace, req.PodInfo.Owner.Name, err,
+		)
+	}
+	if template == nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal,
+			"template materialization returned nil for %s/%s", req.PodInfo.Owner.Namespace, req.PodInfo.Owner.Name,
 		)
 	}
 	podInfo := kdctx.NewPodInfoFromBindingRequest(req)
