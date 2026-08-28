@@ -20,19 +20,21 @@ import (
 )
 
 const (
-	defaultOutput    = "/etc/cni/net.d/10-flannel.conflist"
-	defaultTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-	defaultCAFile    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	defaultOutput     = "/etc/cni/net.d/10-flannel.conflist"
+	defaultTokenFile  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	defaultCAFile     = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	defaultIPAMSource = "/kubedirect-host-local"
 )
 
 type options struct {
-	nodeName  string
-	podCIDR   string
-	output    string
-	apiServer string
-	tokenFile string
-	caFile    string
-	timeout   time.Duration
+	nodeName    string
+	podCIDR     string
+	output      string
+	apiServer   string
+	tokenFile   string
+	caFile      string
+	timeout     time.Duration
+	installIPAM string
 }
 
 type nodeResponse struct {
@@ -109,6 +111,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("render CNI conflist: %v", err)
 	}
+	if opts.installIPAM != "" {
+		plugin, err := os.ReadFile(defaultIPAMSource)
+		if err != nil {
+			log.Fatalf("read bundled IPAM plugin: %v", err)
+		}
+		if err := atomicWrite(opts.installIPAM, plugin, 0o755); err != nil {
+			log.Fatalf("install IPAM plugin: %v", err)
+		}
+		log.Printf("installed bounded host-local shim at %s", opts.installIPAM)
+	}
 	if opts.output == "-" {
 		if _, err := os.Stdout.Write(contents); err != nil {
 			log.Fatalf("write conflist to stdout: %v", err)
@@ -131,6 +143,7 @@ func parseFlags() options {
 	flag.StringVar(&opts.tokenFile, "token-file", defaultTokenFile, "service-account token file")
 	flag.StringVar(&opts.caFile, "ca-file", defaultCAFile, "Kubernetes API CA certificate file")
 	flag.DurationVar(&opts.timeout, "timeout", 30*time.Second, "overall Kubernetes API request timeout")
+	flag.StringVar(&opts.installIPAM, "install-ipam-plugin", "", "install the bundled bounded host-local shim at this path")
 	flag.Parse()
 	return opts
 }
@@ -274,7 +287,7 @@ func renderConflist(ranges addressRange) ([]byte, error) {
 					IsDefaultGateway: true,
 				},
 				IPAM: hostLocalIPAM{
-					Type:       "host-local",
+					Type:       "kubedirect-host-local",
 					RangeStart: ranges.CNIStart.String(),
 					RangeEnd:   ranges.CNIEnd.String(),
 				},

@@ -71,6 +71,7 @@ func TestRenderConflist(t *testing.T) {
 		Plugins []struct {
 			Type string `json:"type"`
 			IPAM struct {
+				Type       string `json:"type"`
 				RangeStart string `json:"rangeStart"`
 				RangeEnd   string `json:"rangeEnd"`
 			} `json:"ipam"`
@@ -84,6 +85,9 @@ func TestRenderConflist(t *testing.T) {
 	}
 	if decoded.Plugins[0].IPAM.RangeStart != "10.244.17.2" || decoded.Plugins[0].IPAM.RangeEnd != "10.244.17.127" {
 		t.Fatalf("unexpected IPAM: %+v", decoded.Plugins[0].IPAM)
+	}
+	if decoded.Plugins[0].IPAM.Type != "kubedirect-host-local" {
+		t.Fatalf("unexpected IPAM type: %q", decoded.Plugins[0].IPAM.Type)
 	}
 }
 

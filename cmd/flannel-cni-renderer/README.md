@@ -1,8 +1,16 @@
 # Flannel CNI renderer
 
 This init-container command reserves the upper half of each physical Node's
-IPv4 PodCIDR for Kubedirect. It fetches the Node through the Kubernetes API and
-writes a Flannel conflist that limits `host-local` to the lower half.
+IPv4 PodCIDR for Kubedirect. It fetches the Node through the Kubernetes API,
+writes a bounded Flannel conflist, and installs the `kubedirect-host-local` IPAM
+shim.
+
+Flannel unconditionally generates an `ipam.ranges` entry covering the complete
+Node PodCIDR. `host-local` gives that modern field precedence over legacy
+top-level `rangeStart` and `rangeEnd` fields. The shim moves the bounds into the
+generated IPv4 range immediately before invoking the real `host-local` binary.
+It uses the same network name and host-local data directory, so existing
+allocation records remain compatible.
 
 For `10.244.17.0/24`, the result is:
 
@@ -17,7 +25,7 @@ or configure addresses for the custom kubelet.
 ## Test locally
 
 ```sh
-go test ./cmd/flannel-cni-renderer
+go test ./cmd/flannel-cni-renderer ./cmd/kubedirect-host-local
 go run ./cmd/flannel-cni-renderer \
   --pod-cidr=10.244.17.0/24 \
   --output=-
@@ -67,6 +75,7 @@ initContainers:
     imagePullPolicy: IfNotPresent
     args:
       - --output=/etc/cni/net.d/10-flannel.conflist
+      - --install-ipam-plugin=/opt/cni/bin/kubedirect-host-local
     env:
       - name: NODE_NAME
         valueFrom:
@@ -82,6 +91,8 @@ initContainers:
     volumeMounts:
       - name: cni
         mountPath: /etc/cni/net.d
+      - name: cni-plugin
+        mountPath: /opt/cni/bin
 ```
 
 The existing Flannel ServiceAccount already needs `get` access to Nodes, which
@@ -114,10 +125,13 @@ Check one renderer log and the resulting host file:
 ```sh
 kubectl -n kube-flannel logs <flannel-pod> -c render-cni
 sudo cat /etc/cni/net.d/10-flannel.conflist
+sudo test -x /opt/cni/bin/kubedirect-host-local
 ```
 
 The log reports the complete Node PodCIDR, the lower-half CNI range, and the
 upper-half reserved range. Before rolling this onto a node that already has
 pods, verify that no existing pod address lies in the upper half. This change
 prevents new allocations there but does not migrate or invalidate existing
-host-local allocations.
+host-local allocations. The Flannel delegate configuration may still display
+the full-subnet `ranges` value because Flannel creates it dynamically; the IPAM
+shim constrains that value before the real host-local allocator sees it.
