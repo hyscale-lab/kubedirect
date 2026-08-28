@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/vhive-serverless/vhive/ctriface"
 )
 
@@ -14,6 +15,7 @@ type vhiveOptions struct {
 	clonePrefix       string
 	dockerCredentials string
 	shimPoolSize      int
+	debug             bool
 }
 
 type vhiveManager struct {
@@ -21,6 +23,10 @@ type vhiveManager struct {
 }
 
 func newVHIVEManager(options vhiveOptions) *vhiveManager {
+	if options.debug {
+		log.SetLevel(log.DebugLevel)
+		log.Debug("vHive debug logging is enabled")
+	}
 	return &vhiveManager{orchestrator: ctriface.NewOrchestrator(
 		options.snapshotter,
 		options.hostInterface,
