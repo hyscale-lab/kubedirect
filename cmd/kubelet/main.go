@@ -50,6 +50,7 @@ func main() {
 	flag.StringVar(&vhiveOpts.clonePrefix, "clone-prefix", "172.18", "vHive guest IPv4 /16 prefix")
 	flag.StringVar(&vhiveOpts.dockerCredentials, "docker-credentials", `{"docker-credentials":{"ghcr.io":{"username":"","password":""}}}`, "Docker credentials passed to vHive")
 	flag.IntVar(&vhiveOpts.shimPoolSize, "shim-pool-size", 5, "Number of vHive Firecracker shims to preallocate")
+	flag.StringVar(&vhiveOpts.snapshotsStorage, "snapshots-storage", defaultSnapshotsStorage(), "Directory used for persistent vHive snapshots")
 	flag.BoolVar(&vhiveOpts.debug, "dbg", false, "Enable debug logging from vHive internals")
 	flag.Parse()
 
