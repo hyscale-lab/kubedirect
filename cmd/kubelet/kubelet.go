@@ -287,7 +287,7 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 		return nil
 	}
 	// api pod only
-	if kdutil.IsPodReady(pod) {
+	if kdutil.IsPodReady(pod) && (!s.simulate || isCurrentSimulatedPodIP(pod.Status)) {
 		kdLogger.V(2).DEBUG("Skipping ready pod")
 		s.readyTimers.Del(pending.String())
 		return nil
@@ -327,6 +327,17 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 			refStatus = ref
 		}
 	}
+	// QoSClass is derived from a pod's resource requirements and is immutable.
+	// Reference pods may use different requirements, so never copy their QoS
+	// class onto the pod whose status is being updated.
+	refStatus.QOSClass = pod.Status.QOSClass
+	// Reference pods can have a different container layout. In particular,
+	// Knative injects queue-proxy into the target pod, while the workload-pool
+	// pod has only the function container. Statuses must cover every container
+	// in the target pod for Kubernetes to report it fully ready.
+	targetStatus := s.simulateRefPodStatus(pod)
+	refStatus.ContainerStatuses = targetStatus.ContainerStatuses
+	refStatus.InitContainerStatuses = targetStatus.InitContainerStatuses
 
 	if _, err := s.markPodReady(ctx, pod, refStatus); err != nil {
 		kdLogger.Error(err, "Failed to mark pod as ready")

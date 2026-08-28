@@ -33,6 +33,15 @@ func init() {
 	rand.Seed(uint64(time.Now().UnixNano()))
 }
 
+// simulatedPodIP is a TEST-NET-1 address. Kubernetes rejects loopback and
+// link-local endpoint addresses, so simulated pods need a syntactically
+// routable PodIP even when the data plane replaces it.
+const simulatedPodIP = "192.0.2.1"
+
+func isCurrentSimulatedPodIP(status corev1.PodStatus) bool {
+	return status.PodIP == simulatedPodIP
+}
+
 // impl kdrpc.Registerer
 func (s *KubedirectServer) Register(sr grpc.ServiceRegistrar) {
 	kdproto.RegisterKubeletServer(sr, s)
@@ -171,8 +180,7 @@ func (s *KubedirectServer) simulateRefPodStatus(pod *corev1.Pod) *corev1.PodStat
 				Status: corev1.ConditionTrue,
 			},
 		},
-		HostIP: "127.0.0.1",
-		PodIP:  "127.0.0.1",
+		PodIP: simulatedPodIP,
 	}
 	for i := range pod.Spec.ReadinessGates {
 		refStatus.Conditions = append(refStatus.Conditions, corev1.PodCondition{
