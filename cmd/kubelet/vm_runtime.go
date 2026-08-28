@@ -24,6 +24,7 @@ const (
 	podServingPort           = 8013
 	defaultFunctionPort      = 80
 	vmCreationTimeout        = 2 * time.Minute
+	shimRefillGracePeriod    = 5 * time.Second
 )
 
 type vmInstance struct {
@@ -174,7 +175,11 @@ func (r *podVMRuntime) ensure(ctx context.Context, key string, pod *corev1.Pod) 
 				startErr = errors.Join(startErr, r.manager.Stop(context.Background(), instance.ID))
 			}
 		}
-		operationCancel()
+		// vHive starts shim-pool refill asynchronously with this context and waits
+		// briefly before doing the work. Keep the successful startup context alive
+		// long enough for that refill instead of canceling it as soon as Start
+		// returns. Pod deletion can still cancel it immediately through the entry.
+		cancelTimer := time.AfterFunc(shimRefillGracePeriod, operationCancel)
 
 		r.mu.Lock()
 		entry.creating = false
@@ -186,6 +191,9 @@ func (r *podVMRuntime) ensure(ctx context.Context, key string, pod *corev1.Pod) 
 		}
 		close(entry.done)
 		r.mu.Unlock()
+		if startErr != nil && cancelTimer.Stop() {
+			operationCancel()
+		}
 		if startErr != nil {
 			return netip.Addr{}, fmt.Errorf("create VM for pod %s: %w", key, startErr)
 		}

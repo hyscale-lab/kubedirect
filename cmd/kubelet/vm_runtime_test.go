@@ -146,6 +146,11 @@ func TestPodVMCreationOutlivesBindRequestDeadline(t *testing.T) {
 	if err := <-result; err != nil {
 		t.Fatalf("VM creation failed after BindPod request cancellation: %v", err)
 	}
+	select {
+	case <-operationCtx.Done():
+		t.Fatal("VM operation context was canceled immediately after creation")
+	case <-time.After(10 * time.Millisecond):
+	}
 }
 
 func TestPodIPAllocatorUsesUpperHalfAndReusesReleasedAddress(t *testing.T) {
