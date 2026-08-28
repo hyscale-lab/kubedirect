@@ -37,11 +37,19 @@ func main() {
 	var simulate bool
 	var patch bool
 	var readyDelayMilliseconds int
+	var vhiveOpts vhiveOptions
 
 	flag.StringVar(&node, "node", "", "Node name this kubelet binds to. Default to hostname if not set")
 	flag.BoolVar(&simulate, "simulate", false, "If true, report pod readiness without binding to real containers")
 	flag.BoolVar(&patch, "patch", true, "If true, use patch instead of update to mark pod ready")
 	flag.IntVar(&readyDelayMilliseconds, "ready-after", 100, "Delay in ms before kubelet reports pod ready")
+	flag.StringVar(&vhiveOpts.snapshotter, "snapshotter", "devmapper", "vHive containerd snapshotter")
+	flag.StringVar(&vhiveOpts.hostInterface, "host-iface", "", "Host network interface used by vHive VMs")
+	flag.IntVar(&vhiveOpts.networkPoolSize, "net-pool-size", 10, "Number of vHive network configurations to preallocate")
+	flag.StringVar(&vhiveOpts.vethPrefix, "veth-prefix", "172.17", "vHive host veth IPv4 /16 prefix")
+	flag.StringVar(&vhiveOpts.clonePrefix, "clone-prefix", "172.18", "vHive guest IPv4 /16 prefix")
+	flag.StringVar(&vhiveOpts.dockerCredentials, "docker-credentials", `{"docker-credentials":{"ghcr.io":{"username":"","password":""}}}`, "Docker credentials passed to vHive")
+	flag.IntVar(&vhiveOpts.shimPoolSize, "shim-pool-size", 5, "Number of vHive Firecracker shims to preallocate")
 	flag.Parse()
 
 	if node == "" {
@@ -60,12 +68,15 @@ func main() {
 		WithReadyDelay(time.Duration(readyDelayMilliseconds) * time.Millisecond)
 	if simulate {
 		kdServer.Simulate()
+	} else {
+		manager := newVHIVEManager(vhiveOpts)
+		kdServer.WithVMRuntime(newPodVMRuntime(manager, iptablesRedirector{binary: "iptables"}))
 	}
 	if patch {
 		kdServer.UsePatch()
 	}
 
-	klog.InfoS("Starting custom kubelet server", "node", node, "simulate", simulate, "ready-after", readyDelayMilliseconds, "patch", patch)
+	klog.InfoS("Starting custom kubelet server", "node", node, "simulate", simulate, "ready-after", readyDelayMilliseconds, "patch", patch, "host-iface", vhiveOpts.hostInterface)
 	if err := kdServer.ListenAndServe(ctx); err != nil {
 		klog.Fatalf("Failed to listen & serve: %v", err)
 	}

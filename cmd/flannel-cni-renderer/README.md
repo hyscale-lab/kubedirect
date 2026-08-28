@@ -19,8 +19,17 @@ For `10.244.17.0/24`, the result is:
 - `10.244.17.1` remains available to the CNI bridge;
 - the subnet and broadcast addresses remain unused.
 
-The renderer only configures ordinary CNI allocation. It does not yet allocate
-or configure addresses for the custom kubelet.
+The renderer only configures ordinary CNI allocation. The custom kubelet owns
+the reserved half: when it binds a supported pod, it assigns the first free
+reserved address, starts a vHive Firecracker VM, and installs a `nat` table
+`PREROUTING` rule that DNATs `<pod-ip>:8013` to the VM guest endpoint. Pod
+deletion removes the rule, stops the VM, and releases the address.
+
+The VM-backed kubelet currently accepts only
+`ghcr.io/vhive-serverless/invitro_trace_function:latest`, mapped to
+`ghcr.io/leokondrashov/invitro_trace_function_firecracker:esgz` as in the vHive
+relay example. It must run as root on a host with the pinned vHive
+firecracker-containerd stack installed, and `iptables` must be available.
 
 ## Test locally
 

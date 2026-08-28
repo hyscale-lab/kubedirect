@@ -77,7 +77,7 @@ func (s *KubedirectServer) Handshake(ctx context.Context, req *kdproto.Handshake
 func (s *KubedirectServer) BindPod(ctx context.Context, req *kdproto.PodBindingRequest) (*emptypb.Empty, error) {
 	kdLogger := kdutil.NewLogger(klog.FromContext(ctx)).WithHeader(req.Source + "->BindPod")
 	// get unnamed pod template
-	_, err := kdutil.GetUnnamedTemplateFor(ctx, s.podLister, req.PodInfo.Owner.Namespace, req.PodInfo.Owner.Name, false)
+	template, err := kdutil.GetUnnamedTemplateFor(ctx, s.podLister, req.PodInfo.Owner.Namespace, req.PodInfo.Owner.Name, false)
 	// err is probably due to:
 	// 1. the template pod was deleted, which means the rs is also deleted
 	// 2. the template pod is not yet added to the informer cache
@@ -95,11 +95,24 @@ func (s *KubedirectServer) BindPod(ctx context.Context, req *kdproto.PodBindingR
 	}
 	defer holder.RUnlock()
 	// check if the pod already exists in in-mem cache
-	if _, fresh := s.inMemCache.GetOrCreate(podInfo.Name, func() *kdctx.PodInfo { return podInfo }); !fresh {
-		kdLogger.WARN("Pod already exists in in-mem cache, will ignore", "pod", podInfo)
-		return &emptypb.Empty{}, nil
+	_, fresh := s.inMemCache.GetOrCreate(podInfo.Name, func() *kdctx.PodInfo { return podInfo })
+	if !fresh {
+		kdLogger.WARN("Pod already exists in in-mem cache, will reuse its allocation", "pod", podInfo)
 	}
 	kdLogger.Info("Binding", "pod", podInfo)
+	if !s.simulate && s.vmRuntime != nil {
+		pod := podInfo.AsPersistentPod(template)
+		pending := NewPendingPodFromInMemCache(podInfo)
+		if _, err := s.vmRuntime.ensure(ctx, pending.String(), pod); err != nil {
+			if fresh {
+				s.inMemCache.Del(podInfo.Name)
+			}
+			return nil, grpcstatus.Errorf(grpccodes.Unavailable, "failed to allocate VM for %s: %v", pending.String(), err)
+		}
+	}
+	if !fresh {
+		return &emptypb.Empty{}, nil
+	}
 	// NOTE: BindPod can be called multiple times for the same pod
 	// the previous GetOrCreate check should avoid most duplicate deliveries
 	// but they can still happen in case the in-mem cache is flushed by informer event handler and BindPod comes in again.

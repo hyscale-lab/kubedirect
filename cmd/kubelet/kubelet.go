@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -85,6 +87,9 @@ type KubedirectServer struct {
 	simulate bool
 	// use patch or update to mark pod ready
 	patch bool
+	// vHive VM and reserved PodIP lifecycle manager. Nil keeps the legacy
+	// reference-pod behavior for tests and simulated deployments.
+	vmRuntime *podVMRuntime
 }
 
 func NewKubedirectServer(c clientset.Interface, nodeName string) *KubedirectServer {
@@ -178,6 +183,11 @@ func (s *KubedirectServer) UsePatch() {
 	s.patch = true
 }
 
+func (s *KubedirectServer) WithVMRuntime(runtime *podVMRuntime) *KubedirectServer {
+	s.vmRuntime = runtime
+	return s
+}
+
 // the managed label is not required because this server also handles k8s-originated pods
 // NOTE: we cannot directly filter on spec.NodeName because there can be kubelet service delegation
 func (s *KubedirectServer) enqueueFilter(pod *corev1.Pod) bool {
@@ -206,12 +216,17 @@ func (s *KubedirectServer) handlePodEvent(obj interface{}, isDelete bool) {
 		return
 	}
 	pending := NewPendingPodFromAPIServer(pod)
-	// NOTE: there is no clean up to do(except clearing timers) after deletion of the api object
-	// because the custom kubelet simply binds a pod to an existing reference pod from workload pool
 	if !isDelete {
 		s.queue.Add(pending)
 	} else {
 		s.readyTimers.Del(pending.String())
+		if s.vmRuntime != nil {
+			go func() {
+				if err := s.vmRuntime.remove(context.Background(), pending.String()); err != nil {
+					kdLogger.Error(err, "Failed to remove pod VM", "pod", pending.String())
+				}
+			}()
+		}
 	}
 	// NOTE: the custom kubelet handles both kd-managed and k8s-originated pods
 	// but only managed ones are added to in-mem cache
@@ -267,10 +282,16 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 
 	// check api pod status
 	// NOTE: deletion timestamp can only be set on api pods; in-mem pods only occur during creation
-	// NOTE: we can immediately remove the api object once deletion is requested
-	// because the custom kubelet simply binds a pod to an existing reference pod from workload pool
+	// Tear down VM-backed resources before force-deleting the API object. The
+	// delete event provides a second, idempotent cleanup path.
 	if pod.DeletionTimestamp != nil {
 		kdLogger.V(1).Info("Deleting pod")
+		if s.vmRuntime != nil {
+			if err := s.vmRuntime.remove(ctx, pending.String()); err != nil {
+				kdLogger.Error(err, "Failed to remove pod VM")
+				return err
+			}
+		}
 		if err := s.initClient.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
 			GracePeriodSeconds: new(int64), // Set gracePeriodSeconds to 0 to force delete
 		}); err != nil && !apierrors.IsNotFound(err) {
@@ -286,8 +307,19 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 		s.readyTimers.Del(pending.String())
 		return nil
 	}
+
+	var assignedPodIP netip.Addr
+	if !s.simulate && s.vmRuntime != nil {
+		var err error
+		assignedPodIP, err = s.vmRuntime.ensure(ctx, pending.String(), pod)
+		if err != nil {
+			kdLogger.Error(err, "Failed to allocate pod VM")
+			return err
+		}
+	}
 	// api pod only
-	if kdutil.IsPodReady(pod) && (!s.simulate || isCurrentSimulatedPodIP(pod.Status)) {
+	readyPodIPIsCurrent := !s.simulate && (!assignedPodIP.IsValid() || pod.Status.PodIP == assignedPodIP.String())
+	if kdutil.IsPodReady(pod) && (readyPodIPIsCurrent || s.simulate && isCurrentSimulatedPodIP(pod.Status)) {
 		kdLogger.V(2).DEBUG("Skipping ready pod")
 		s.readyTimers.Del(pending.String())
 		return nil
@@ -317,7 +349,7 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 
 	// get reference pod status
 	var refStatus *corev1.PodStatus
-	if s.simulate {
+	if s.simulate || s.vmRuntime != nil {
 		refStatus = s.simulateRefPodStatus(pod)
 	} else {
 		if ref, err := s.getRefPodStatus(pod); err != nil {
@@ -338,6 +370,10 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 	targetStatus := s.simulateRefPodStatus(pod)
 	refStatus.ContainerStatuses = targetStatus.ContainerStatuses
 	refStatus.InitContainerStatuses = targetStatus.InitContainerStatuses
+	if assignedPodIP.IsValid() {
+		refStatus.PodIP = assignedPodIP.String()
+		refStatus.PodIPs = []corev1.PodIP{{IP: assignedPodIP.String()}}
+	}
 
 	if _, err := s.markPodReady(ctx, pod, refStatus); err != nil {
 		kdLogger.Error(err, "Failed to mark pod as ready")
@@ -385,6 +421,44 @@ func (s *KubedirectServer) ListenAndServe(ctx context.Context) error {
 		}
 	}
 
+	if s.vmRuntime != nil {
+		node, err := s.nodeLister.Get(s.nodeName)
+		if err != nil {
+			return fmt.Errorf("get node %s for pod VM networking: %w", s.nodeName, err)
+		}
+		podCIDR, err := nodeIPv4PodCIDR(node)
+		if err != nil {
+			return fmt.Errorf("configure pod VM networking: %w", err)
+		}
+		if err := s.vmRuntime.configurePodCIDR(podCIDR); err != nil {
+			return fmt.Errorf("configure pod VM networking: %w", err)
+		}
+		pods, err := s.podLister.List(labels.Everything())
+		if err != nil {
+			return fmt.Errorf("list existing pods for pod VM networking: %w", err)
+		}
+		for _, pod := range pods {
+			if !s.enqueueFilter(pod) || pod.Status.PodIP == "" {
+				continue
+			}
+			if _, err := vmSpecForPod(pod); err != nil {
+				continue
+			}
+			responsible, err := s.isResponsibleFor(pod)
+			if err != nil {
+				return err
+			}
+			if responsible {
+				pending := NewPendingPodFromAPIServer(pod)
+				key := pending.String()
+				if err := s.vmRuntime.reservePodIP(key, pod.Status.PodIP); err != nil {
+					return fmt.Errorf("reserve existing PodIP for %s: %w", key, err)
+				}
+			}
+		}
+		kdLogger.Info("Configured pod VM networking", "podCIDR", podCIDR)
+	}
+
 	publishServiceAddr := func(ctx context.Context) (bool, error) {
 		node, err := s.nodeLister.Get(s.nodeName)
 		if apierrors.IsNotFound(err) {
@@ -421,6 +495,31 @@ func (s *KubedirectServer) ListenAndServe(ctx context.Context) error {
 	}
 
 	return s.serverHub.ListenAndServe(ctx, CustomKubeletServicePort)
+}
+
+func nodeIPv4PodCIDR(node *corev1.Node) (string, error) {
+	candidates := append([]string(nil), node.Spec.PodCIDRs...)
+	if node.Spec.PodCIDR != "" {
+		candidates = append(candidates, node.Spec.PodCIDR)
+	}
+	var selected string
+	for _, candidate := range candidates {
+		prefix, err := netip.ParsePrefix(candidate)
+		if err != nil {
+			return "", fmt.Errorf("parse Node PodCIDR %q: %w", candidate, err)
+		}
+		if !prefix.Addr().Is4() {
+			continue
+		}
+		if selected != "" && selected != candidate {
+			return "", fmt.Errorf("node %s has more than one IPv4 PodCIDR", node.Name)
+		}
+		selected = candidate
+	}
+	if selected == "" {
+		return "", fmt.Errorf("node %s has no IPv4 PodCIDR", node.Name)
+	}
+	return selected, nil
 }
 
 func (s *KubedirectServer) unwrapPodObj(kdLogger *kdutil.Logger, obj interface{}) *corev1.Pod {
