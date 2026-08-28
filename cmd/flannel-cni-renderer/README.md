@@ -135,3 +135,114 @@ prevents new allocations there but does not migrate or invalidate existing
 host-local allocations. The Flannel delegate configuration may still display
 the full-subnet `ranges` value because Flannel creates it dynamically; the IPAM
 shim constrains that value before the real host-local allocator sees it.
+
+## Test routing to a reserved address
+
+The following example verifies that an address excluded from CNI allocation is
+still routed to the Node that owns the complete PodCIDR. It assumes:
+
+- `worker-target` owns `10.168.12.0/22`;
+- ordinary pods use the lower half, `10.168.12.2` through `10.168.13.255`;
+- the reserved half is `10.168.14.0` through `10.168.15.254`, including
+  `10.168.15.130`; and
+- `worker-source` is a different Node.
+
+First confirm the assignment. Substitute the actual Node names if necessary:
+
+```sh
+export TARGET_NODE=worker-target
+export SOURCE_NODE=worker-source
+
+kubectl get node "$TARGET_NODE" \
+  -o jsonpath='{.metadata.name}{" podCIDR="}{.spec.podCIDR}{"\n"}'
+```
+
+Start BusyBox `httpd` in the target Node's network namespace, listening only
+on its loopback address:
+
+```sh
+kubectl run reserved-range-httpd \
+  --image=busybox:1.36 \
+  --restart=Never \
+  --overrides="{\"spec\":{\"nodeName\":\"${TARGET_NODE}\",\"hostNetwork\":true}}" \
+  -- sh -c \
+  'mkdir -p /www && printf "reached %s\n" "$(hostname)" >/www/index.html && exec httpd -f -p 127.0.0.1:8080 -h /www'
+
+kubectl wait --for=condition=Ready pod/reserved-range-httpd --timeout=60s
+```
+
+On `worker-target`, enable routing to loopback and install narrowly scoped
+rules. `route_localnet` is required because the DNAT result is `127.0.0.1` but
+the packet arrived from another Node. The INPUT rule is needed only when the
+host firewall would otherwise reject the packet.
+
+```sh
+sudo sysctl -w net.ipv4.conf.all.route_localnet=1
+
+sudo iptables -w -t nat -I PREROUTING 1 \
+  -i flannel.1 -p tcp -d 10.168.15.130 --dport 8013 \
+  -m comment --comment kubedirect-reserved-range-test \
+  -j DNAT --to-destination 127.0.0.1:8080
+
+sudo iptables -w -I INPUT 1 \
+  -i flannel.1 -p tcp -d 127.0.0.1 --dport 8080 \
+  -m conntrack --ctstate NEW \
+  -m comment --comment kubedirect-reserved-range-test \
+  -j ACCEPT
+```
+
+If Flannel uses a backend other than VXLAN, replace `flannel.1` with the
+interface on which traffic from `worker-source` arrives. `tcpdump -ni any host
+10.168.15.130` on the target Node can identify it.
+
+On `worker-source`, this should resolve to the route Flannel installed for
+`worker-target`'s complete PodCIDR (normally through `flannel.1` for VXLAN):
+
+```sh
+ip route get 10.168.15.130
+```
+
+Now start a one-shot client pod on `worker-source`:
+
+```sh
+kubectl run reserved-range-client \
+  --rm -i \
+  --image=busybox:1.36 \
+  --restart=Never \
+  --overrides="{\"spec\":{\"nodeName\":\"${SOURCE_NODE}\"}}" \
+  -- wget -T 5 -qO- http://10.168.15.130:8013/
+```
+
+The response should be `reached reserved-range-httpd`. This path proves all of
+the relevant steps: Flannel routes the reserved destination using the complete
+Node PodCIDR, the packet reaches `worker-target`, PREROUTING translates
+`10.168.15.130:8013` to `127.0.0.1:8080`, and conntrack applies the reverse
+translation to the reply. The target Node does not need `10.168.15.130`
+assigned to a local interface.
+
+On `worker-target`, the DNAT counter should increase after the request:
+
+```sh
+sudo iptables -w -t nat -L PREROUTING -n -v --line-numbers | \
+  grep kubedirect-reserved-range-test
+```
+
+Remove the temporary resources and restore the previous `route_localnet` value
+when finished (the example assumes its original value was `0`):
+
+```sh
+kubectl delete pod reserved-range-httpd --ignore-not-found
+
+sudo iptables -w -t nat -D PREROUTING \
+  -i flannel.1 -p tcp -d 10.168.15.130 --dport 8013 \
+  -m comment --comment kubedirect-reserved-range-test \
+  -j DNAT --to-destination 127.0.0.1:8080
+
+sudo iptables -w -D INPUT \
+  -i flannel.1 -p tcp -d 127.0.0.1 --dport 8080 \
+  -m conntrack --ctstate NEW \
+  -m comment --comment kubedirect-reserved-range-test \
+  -j ACCEPT
+
+sudo sysctl -w net.ipv4.conf.all.route_localnet=0
+```
