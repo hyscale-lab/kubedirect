@@ -8,16 +8,20 @@ import (
 	"net/netip"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 
+	"github.com/opencontainers/go-digest"
 	corev1 "k8s.io/api/core/v1"
 )
 
 const (
-	supportedPodImage   = "ghcr.io/vhive-serverless/invitro_trace_function:latest"
-	vhiveFunctionImage  = "ghcr.io/leokondrashov/invitro_trace_function_firecracker:esgz"
-	podServingPort      = 8013
-	defaultFunctionPort = 80
+	userContainerName        = "user-container"
+	supportedImageRepository = "ghcr.io/vhive-serverless/invitro_trace_function"
+	supportedPodImage        = supportedImageRepository + ":latest"
+	vhiveFunctionImage       = "ghcr.io/leokondrashov/invitro_trace_function_firecracker:esgz"
+	podServingPort           = 8013
+	defaultFunctionPort      = 80
 )
 
 type vmInstance struct {
@@ -240,8 +244,14 @@ type vmSpec struct {
 func vmSpecForPod(pod *corev1.Pod) (vmSpec, error) {
 	for i := range pod.Spec.Containers {
 		container := &pod.Spec.Containers[i]
-		if container.Image != supportedPodImage {
+		if container.Name != userContainerName {
 			continue
+		}
+		if !isSupportedUserImage(container.Image) {
+			return vmSpec{}, fmt.Errorf(
+				"pod %s/%s user container image %q is unsupported; expected %q or its resolved sha256 digest",
+				pod.Namespace, pod.Name, container.Image, supportedPodImage,
+			)
 		}
 		port := int32(defaultFunctionPort)
 		if len(container.Ports) != 0 && container.Ports[0].ContainerPort != 0 {
@@ -262,7 +272,19 @@ func vmSpecForPod(pod *corev1.Pod) (vmSpec, error) {
 			port:        port,
 		}, nil
 	}
-	return vmSpec{}, fmt.Errorf("pod %s/%s does not contain supported image %q", pod.Namespace, pod.Name, supportedPodImage)
+	return vmSpec{}, fmt.Errorf("pod %s/%s does not contain container %q", pod.Namespace, pod.Name, userContainerName)
+}
+
+func isSupportedUserImage(image string) bool {
+	if image == supportedPodImage {
+		return true
+	}
+	digestValue, found := strings.CutPrefix(image, supportedImageRepository+"@")
+	if !found {
+		return false
+	}
+	parsed, err := digest.Parse(digestValue)
+	return err == nil && parsed.Algorithm() == digest.SHA256 && parsed.Validate() == nil
 }
 
 func setEnvironment(environment []string, name, value string) []string {

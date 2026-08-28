@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/netip"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -135,10 +136,32 @@ func TestPodIPAllocatorReplacesLegacyAddress(t *testing.T) {
 func TestVMRuntimeRejectsUnsupportedImage(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "unsupported"},
-		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Image: "busybox:latest"}}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "queue-proxy", Image: supportedPodImage},
+			{Name: userContainerName, Image: "busybox:latest"},
+		}},
 	}
 	if _, err := vmSpecForPod(pod); err == nil {
-		t.Fatal("vmSpecForPod accepted an unsupported image")
+		t.Fatal("vmSpecForPod accepted queue-proxy's image instead of checking user-container")
+	}
+}
+
+func TestSupportedUserImageReferences(t *testing.T) {
+	digestImage := supportedImageRepository + "@sha256:" + strings.Repeat("a", 64)
+	tests := []struct {
+		image string
+		want  bool
+	}{
+		{image: supportedPodImage, want: true},
+		{image: digestImage, want: true},
+		{image: supportedImageRepository + ":dev", want: false},
+		{image: supportedImageRepository + "@sha256:not-a-digest", want: false},
+		{image: "ghcr.io/example/invitro_trace_function@sha256:" + strings.Repeat("a", 64), want: false},
+	}
+	for _, test := range tests {
+		if got := isSupportedUserImage(test.image); got != test.want {
+			t.Errorf("isSupportedUserImage(%q) = %t, want %t", test.image, got, test.want)
+		}
 	}
 }
 
@@ -163,6 +186,7 @@ func supportedPod(name string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:  userContainerName,
 			Image: supportedPodImage,
 			Ports: []corev1.ContainerPort{{ContainerPort: 80}},
 			Env:   []corev1.EnvVar{{Name: "ITERATIONS_MULTIPLIER", Value: "102"}},

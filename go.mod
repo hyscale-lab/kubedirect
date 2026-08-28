@@ -11,6 +11,7 @@ require (
 require (
 	github.com/go-logr/logr v1.4.2
 	github.com/go-logr/zapr v1.3.0
+	github.com/opencontainers/go-digest v1.0.0
 	github.com/sirupsen/logrus v1.9.3
 	go.uber.org/zap v1.27.0
 	golang.design/x/chann v0.1.2
@@ -81,7 +82,6 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.0 // indirect
 	github.com/opencontainers/runc v1.1.14 // indirect
 	github.com/opencontainers/runtime-spec v1.0.3-0.20210910115017-0d6cc581aeea // indirect
