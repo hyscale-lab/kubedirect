@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"golang.org/x/exp/rand"
@@ -33,13 +34,29 @@ func init() {
 	rand.Seed(uint64(time.Now().UnixNano()))
 }
 
-// simulatedPodIP is a TEST-NET-1 address. Kubernetes rejects loopback and
-// link-local endpoint addresses, so simulated pods need a syntactically
-// routable PodIP even when the data plane replaces it.
-const simulatedPodIP = "192.0.2.1"
+func (s *KubedirectServer) allocateSimulatedPodIP(key, previous string) (netip.Addr, error) {
+	s.simulatedPodIPsMu.Lock()
+	defer s.simulatedPodIPsMu.Unlock()
+	if s.simulatedPodIPs == nil {
+		return netip.Addr{}, fmt.Errorf("simulated pod IP allocator has no Node PodCIDR")
+	}
+	preferred, _ := netip.ParseAddr(previous)
+	ip, err := s.simulatedPodIPs.allocate(key, preferred)
+	if err == nil || !preferred.IsValid() {
+		return ip, err
+	}
+	// A stale simulated status can collide with another pod after a kubelet
+	// restart. Fall back to the next free address rather than preserving the
+	// duplicate EndpointSlice address.
+	return s.simulatedPodIPs.allocate(key, netip.Addr{})
+}
 
-func isCurrentSimulatedPodIP(status corev1.PodStatus) bool {
-	return status.PodIP == simulatedPodIP
+func (s *KubedirectServer) releaseSimulatedPodIP(key string) {
+	s.simulatedPodIPsMu.Lock()
+	defer s.simulatedPodIPsMu.Unlock()
+	if s.simulatedPodIPs != nil {
+		s.simulatedPodIPs.release(key)
+	}
 }
 
 // impl kdrpc.Registerer
@@ -176,7 +193,7 @@ func (s *KubedirectServer) getRefPodStatus(pod *corev1.Pod) (*corev1.PodStatus, 
 	return refStatus, nil
 }
 
-func (s *KubedirectServer) simulateRefPodStatus(pod *corev1.Pod) *corev1.PodStatus {
+func (s *KubedirectServer) simulateRefPodStatus(pod *corev1.Pod, podIP string) *corev1.PodStatus {
 	// simulate the reference pod status
 	refStatus := &corev1.PodStatus{
 		Phase: corev1.PodRunning,
@@ -198,7 +215,8 @@ func (s *KubedirectServer) simulateRefPodStatus(pod *corev1.Pod) *corev1.PodStat
 				Status: corev1.ConditionTrue,
 			},
 		},
-		PodIP: simulatedPodIP,
+		PodIP:  podIP,
+		PodIPs: []corev1.PodIP{{IP: podIP}},
 	}
 	for i := range pod.Spec.ReadinessGates {
 		refStatus.Conditions = append(refStatus.Conditions, corev1.PodCondition{

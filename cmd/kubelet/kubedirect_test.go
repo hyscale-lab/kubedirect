@@ -55,56 +55,37 @@ func TestBindPodMaterializesTemplateBeforeVMAllocation(t *testing.T) {
 
 func TestSimulateRefPodStatusSetsPodIP(t *testing.T) {
 	pod := &corev1.Pod{}
-	status := (&KubedirectServer{}).simulateRefPodStatus(pod)
+	const podIP = "10.244.17.128"
+	status := (&KubedirectServer{}).simulateRefPodStatus(pod, podIP)
 
-	if status.PodIP != simulatedPodIP {
-		t.Fatalf("PodIP = %q, want %q", status.PodIP, simulatedPodIP)
+	if status.PodIP != podIP {
+		t.Fatalf("PodIP = %q, want %q", status.PodIP, podIP)
 	}
 	if status.HostIP != "" {
 		t.Fatalf("HostIP = %q, want empty", status.HostIP)
 	}
-	if len(status.PodIPs) != 0 {
-		t.Fatalf("len(PodIPs) = %d, want 0", len(status.PodIPs))
+	if len(status.PodIPs) != 1 || status.PodIPs[0].IP != podIP {
+		t.Fatalf("PodIPs = %#v, want [%s]", status.PodIPs, podIP)
 	}
 	ip := net.ParseIP(status.PodIP)
 	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		t.Fatalf("PodIP %q is not valid for an EndpointSlice address", status.PodIP)
 	}
-	if !isCurrentSimulatedPodIP(*status) {
-		t.Fatal("new simulated status was considered stale")
-	}
 }
 
-func TestCurrentSimulatedPodIP(t *testing.T) {
-	tests := []struct {
-		name   string
-		status corev1.PodStatus
-		want   bool
-	}{
-		{
-			name: "current",
-			status: corev1.PodStatus{
-				PodIP: simulatedPodIP,
-			},
-			want: true,
-		},
-		{
-			name:   "missing podIP",
-			status: corev1.PodStatus{},
-		},
-		{
-			name: "old loopback address",
-			status: corev1.PodStatus{
-				PodIP: "127.0.0.1",
-			},
-		},
-	}
+func TestSimulatedPodIPAllocatorUsesUpperHalfAndAssignsUniqueAddresses(t *testing.T) {
+	server := &KubedirectServer{}
+	server.simulatedPodIPs, _ = newPodIPAllocator("10.244.17.0/24")
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := isCurrentSimulatedPodIP(test.status); got != test.want {
-				t.Fatalf("isCurrentSimulatedPodIP() = %t, want %t", got, test.want)
-			}
-		})
+	first, err := server.allocateSimulatedPodIP("default/a", "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := server.allocateSimulatedPodIP("default/b", first.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.String() != "10.244.17.128" || second.String() != "10.244.17.129" {
+		t.Fatalf("simulated PodIPs = %s, %s; want upper-half unique addresses", first, second)
 	}
 }

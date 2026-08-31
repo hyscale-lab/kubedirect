@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -88,8 +89,13 @@ type KubedirectServer struct {
 	// use patch or update to mark pod ready
 	patch bool
 	// vHive VM and reserved PodIP lifecycle manager. Nil keeps the legacy
-	// reference-pod behavior for tests and simulated deployments.
+	// reference-pod behavior for non-simulated test deployments.
 	vmRuntime *podVMRuntime
+	// simulatedPodIPs owns the same upper half of the Node PodCIDR as the VM
+	// runtime would. Simulated pods still need unique PodIPs so EndpointSlices
+	// retain every ready replica.
+	simulatedPodIPs   *podIPAllocator
+	simulatedPodIPsMu sync.Mutex
 }
 
 func NewKubedirectServer(c clientset.Interface, nodeName string) *KubedirectServer {
@@ -220,6 +226,9 @@ func (s *KubedirectServer) handlePodEvent(obj interface{}, isDelete bool) {
 		s.queue.Add(pending)
 	} else {
 		s.readyTimers.Del(pending.String())
+		if s.simulate {
+			s.releaseSimulatedPodIP(pending.String())
+		}
 		if s.vmRuntime != nil {
 			go func() {
 				if err := s.vmRuntime.remove(context.Background(), pending.String()); err != nil {
@@ -286,6 +295,9 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 	// delete event provides a second, idempotent cleanup path.
 	if pod.DeletionTimestamp != nil {
 		kdLogger.V(1).Info("Deleting pod")
+		if s.simulate {
+			s.releaseSimulatedPodIP(pending.String())
+		}
 		if s.vmRuntime != nil {
 			if err := s.vmRuntime.remove(ctx, pending.String()); err != nil {
 				kdLogger.Error(err, "Failed to remove pod VM")
@@ -309,7 +321,14 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 	}
 
 	var assignedPodIP netip.Addr
-	if !s.simulate && s.vmRuntime != nil {
+	if s.simulate {
+		var err error
+		assignedPodIP, err = s.allocateSimulatedPodIP(pending.String(), pod.Status.PodIP)
+		if err != nil {
+			kdLogger.Error(err, "Failed to allocate simulated pod IP")
+			return err
+		}
+	} else if s.vmRuntime != nil {
 		var err error
 		assignedPodIP, err = s.vmRuntime.ensure(ctx, pending.String(), pod)
 		if err != nil {
@@ -318,8 +337,8 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 		}
 	}
 	// api pod only
-	readyPodIPIsCurrent := !s.simulate && (!assignedPodIP.IsValid() || pod.Status.PodIP == assignedPodIP.String())
-	if kdutil.IsPodReady(pod) && (readyPodIPIsCurrent || s.simulate && isCurrentSimulatedPodIP(pod.Status)) {
+	readyPodIPIsCurrent := !assignedPodIP.IsValid() || pod.Status.PodIP == assignedPodIP.String()
+	if kdutil.IsPodReady(pod) && readyPodIPIsCurrent {
 		kdLogger.V(2).DEBUG("Skipping ready pod")
 		s.readyTimers.Del(pending.String())
 		return nil
@@ -350,7 +369,7 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 	// get reference pod status
 	var refStatus *corev1.PodStatus
 	if s.simulate || s.vmRuntime != nil {
-		refStatus = s.simulateRefPodStatus(pod)
+		refStatus = s.simulateRefPodStatus(pod, assignedPodIP.String())
 	} else {
 		if ref, err := s.getRefPodStatus(pod); err != nil {
 			kdLogger.Error(err, "Failed to get reference pod status")
@@ -367,7 +386,7 @@ func (s *KubedirectServer) SyncPod(ctx context.Context, pending PendingPod) erro
 	// Knative injects queue-proxy into the target pod, while the workload-pool
 	// pod has only the function container. Statuses must cover every container
 	// in the target pod for Kubernetes to report it fully ready.
-	targetStatus := s.simulateRefPodStatus(pod)
+	targetStatus := s.simulateRefPodStatus(pod, refStatus.PodIP)
 	refStatus.ContainerStatuses = targetStatus.ContainerStatuses
 	refStatus.InitContainerStatuses = targetStatus.InitContainerStatuses
 	if assignedPodIP.IsValid() {
@@ -421,42 +440,57 @@ func (s *KubedirectServer) ListenAndServe(ctx context.Context) error {
 		}
 	}
 
-	if s.vmRuntime != nil {
+	if s.vmRuntime != nil || s.simulate {
 		node, err := s.nodeLister.Get(s.nodeName)
 		if err != nil {
-			return fmt.Errorf("get node %s for pod VM networking: %w", s.nodeName, err)
+			return fmt.Errorf("get node %s for pod IP allocation: %w", s.nodeName, err)
 		}
 		podCIDR, err := nodeIPv4PodCIDR(node)
 		if err != nil {
-			return fmt.Errorf("configure pod VM networking: %w", err)
+			return fmt.Errorf("configure pod IP allocation: %w", err)
 		}
-		if err := s.vmRuntime.configurePodCIDR(podCIDR); err != nil {
-			return fmt.Errorf("configure pod VM networking: %w", err)
-		}
-		pods, err := s.podLister.List(labels.Everything())
-		if err != nil {
-			return fmt.Errorf("list existing pods for pod VM networking: %w", err)
-		}
-		for _, pod := range pods {
-			if !s.enqueueFilter(pod) || pod.Status.PodIP == "" {
-				continue
+		if s.vmRuntime != nil {
+			if err := s.vmRuntime.configurePodCIDR(podCIDR); err != nil {
+				return fmt.Errorf("configure pod VM networking: %w", err)
 			}
-			if _, err := vmSpecForPod(pod); err != nil {
-				continue
-			}
-			responsible, err := s.isResponsibleFor(pod)
+		}
+		if s.simulate {
+			ips, err := newPodIPAllocator(podCIDR)
 			if err != nil {
-				return err
+				return fmt.Errorf("configure simulated pod IP allocation: %w", err)
 			}
-			if responsible {
-				pending := NewPendingPodFromAPIServer(pod)
-				key := pending.String()
-				if err := s.vmRuntime.reservePodIP(key, pod.Status.PodIP); err != nil {
-					return fmt.Errorf("reserve existing PodIP for %s: %w", key, err)
+			s.simulatedPodIPsMu.Lock()
+			s.simulatedPodIPs = ips
+			s.simulatedPodIPsMu.Unlock()
+		}
+		if s.vmRuntime != nil {
+			pods, err := s.podLister.List(labels.Everything())
+			if err != nil {
+				return fmt.Errorf("list existing pods for pod VM networking: %w", err)
+			}
+			for _, pod := range pods {
+				if !s.enqueueFilter(pod) || pod.Status.PodIP == "" {
+					continue
+				}
+				if _, err := vmSpecForPod(pod); err != nil {
+					continue
+				}
+				responsible, err := s.isResponsibleFor(pod)
+				if err != nil {
+					return err
+				}
+				if responsible {
+					pending := NewPendingPodFromAPIServer(pod)
+					key := pending.String()
+					if err := s.vmRuntime.reservePodIP(key, pod.Status.PodIP); err != nil {
+						return fmt.Errorf("reserve existing PodIP for %s: %w", key, err)
+					}
 				}
 			}
+			kdLogger.Info("Configured pod VM networking", "podCIDR", podCIDR)
+		} else {
+			kdLogger.Info("Configured simulated pod IP allocation", "podCIDR", podCIDR)
 		}
-		kdLogger.Info("Configured pod VM networking", "podCIDR", podCIDR)
 	}
 
 	publishServiceAddr := func(ctx context.Context) (bool, error) {
