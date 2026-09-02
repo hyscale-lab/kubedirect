@@ -24,7 +24,6 @@ const (
 	podServingPort           = 8013
 	defaultFunctionPort      = 80
 	vmCreationTimeout        = 2 * time.Minute
-	shimRefillGracePeriod    = 5 * time.Second
 )
 
 type vmInstance struct {
@@ -175,12 +174,15 @@ func (r *podVMRuntime) ensure(ctx context.Context, key string, pod *corev1.Pod) 
 				startErr = errors.Join(startErr, r.manager.Stop(context.Background(), instance.ID))
 			}
 		}
-		// vHive starts shim-pool refill asynchronously with this context and waits
-		// briefly before doing the work. Keep the successful startup context alive
-		// long enough for that refill instead of canceling it as soon as Start
-		// returns. Pod deletion can still cancel it immediately through the entry.
-		cancelTimer := time.AfterFunc(shimRefillGracePeriod, operationCancel)
-
+		// vHive's ShimPool.AcquireShim starts the pool refill asynchronously,
+		// reusing this same context for the lifetime of that background work —
+		// there is no way to give it a separately-scoped context from our side.
+		// A fixed grace period before canceling is a race (refill can still be
+		// running once it elapses under contention), so instead we deliberately
+		// do not cancel operationCtx here at all: its own vmCreationTimeout
+		// deadline is the cleanup backstop, giving the refill the same budget
+		// we already grant VM creation. Pod deletion can still cancel it
+		// immediately through the entry while creation is in flight.
 		r.mu.Lock()
 		entry.creating = false
 		entry.creationCancel = nil
@@ -191,9 +193,6 @@ func (r *podVMRuntime) ensure(ctx context.Context, key string, pod *corev1.Pod) 
 		}
 		close(entry.done)
 		r.mu.Unlock()
-		if startErr != nil && cancelTimer.Stop() {
-			operationCancel()
-		}
 		if startErr != nil {
 			return netip.Addr{}, fmt.Errorf("create VM for pod %s: %w", key, startErr)
 		}
