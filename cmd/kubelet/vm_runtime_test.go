@@ -118,6 +118,44 @@ func TestPodVMRuntimeLifecycle(t *testing.T) {
 	}
 }
 
+func TestPodVMRuntimeShutdownRemovesEveryTrackedPod(t *testing.T) {
+	manager := &fakeVMManager{}
+	redirector := &fakeRedirector{}
+	runtime := newPodVMRuntime(manager, redirector)
+	if err := runtime.configurePodCIDR("10.244.17.0/24"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := runtime.ensure(context.Background(), "default/pod-a", supportedPod("pod-a")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.ensure(context.Background(), "default/pod-b", supportedPod("pod-b")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runtime.shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if manager.stops != 2 || redirector.removes != 2 {
+		t.Fatalf("stops=%d redirect removals=%d, want two each", manager.stops, redirector.removes)
+	}
+	runtime.mu.Lock()
+	remaining := len(runtime.entries)
+	runtime.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("shutdown left %d entries behind", remaining)
+	}
+
+	// Calling shutdown again with nothing left to clean up must be a no-op,
+	// not a repeat teardown of already-removed pods.
+	if err := runtime.shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if manager.stops != 2 || redirector.removes != 2 {
+		t.Fatalf("second shutdown re-ran teardown: stops=%d removals=%d", manager.stops, redirector.removes)
+	}
+}
+
 func TestPodVMCreationOutlivesBindRequestDeadline(t *testing.T) {
 	manager := &blockingVMManager{
 		started: make(chan context.Context, 1),

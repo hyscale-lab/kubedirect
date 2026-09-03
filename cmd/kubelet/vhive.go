@@ -32,6 +32,7 @@ type vhiveManager struct {
 	orchestrator vhiveOrchestrator
 	snapshots    snapshotManager
 	snapshotMu   sync.Mutex
+	shutdownOnce sync.Once
 }
 
 type vhiveOrchestrator interface {
@@ -40,6 +41,7 @@ type vhiveOrchestrator interface {
 	PauseVM(context.Context, string) error
 	CreateSnapshot(context.Context, string, *snapshotting.Snapshot) error
 	StopSingleVM(context.Context, string) error
+	Cleanup()
 }
 
 type snapshotManager interface {
@@ -60,7 +62,13 @@ func newVHIVEManager(options vhiveOptions) *vhiveManager {
 	orchestrator := ctriface.NewOrchestrator(
 		options.snapshotter,
 		options.hostInterface,
-		ctriface.WithTestModeOn(false),
+		// vHive's own SIGINT/SIGTERM handler (installed when testModeOn is
+		// false) races the process's graceful shutdown and hard os.Exit(0)s
+		// right after Cleanup(), which can cut that shutdown off mid-flight.
+		// Keep test mode on to suppress it; main.go drives one coordinated
+		// shutdown instead and calls Shutdown() itself once workers have
+		// stopped and every pod VM has been torn down.
+		ctriface.WithTestModeOn(true),
 		ctriface.WithSnapshotMode("local"),
 		ctriface.WithSnapshotsStorage(options.snapshotsStorage),
 		ctriface.WithNetPoolSize(options.networkPoolSize),
@@ -73,6 +81,18 @@ func newVHIVEManager(options vhiveOptions) *vhiveManager {
 		orchestrator: orchestrator,
 		snapshots:    orchestrator.GetSnapshotManager(),
 	}
+}
+
+// Shutdown removes every veth/bridge/network-namespace vHive created,
+// including its preallocated network pool. Call it only after every VM has
+// already been stopped (see podVMRuntime.shutdown): vHive's own Cleanup()
+// tears down network configs for VMs that are still running before it stops
+// them, so calling this first can leave interfaces behind. Safe to call more
+// than once; only the first call does anything.
+func (m *vhiveManager) Shutdown() {
+	m.shutdownOnce.Do(func() {
+		m.orchestrator.Cleanup()
+	})
 }
 
 func defaultSnapshotsStorage() string {

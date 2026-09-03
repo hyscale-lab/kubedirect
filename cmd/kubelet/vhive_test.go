@@ -52,6 +52,10 @@ func (o *fakeVHIVEOrchestrator) StopSingleVM(context.Context, string) error {
 	return nil
 }
 
+func (o *fakeVHIVEOrchestrator) Cleanup() {
+	o.record("cleanup")
+}
+
 type fakeSnapshotManager struct {
 	mu     sync.Mutex
 	events *[]string
@@ -162,6 +166,18 @@ func TestVHIVEManagerCreatesMissingSnapshotBeforeStop(t *testing.T) {
 	}
 	if !reflect.DeepEqual(orchestrator.events, []string{"pause", "create", "stop", "stop"}) {
 		t.Fatalf("existing snapshot should skip creation; events = %v", orchestrator.events)
+	}
+}
+
+func TestVHIVEManagerShutdownCallsCleanupOnce(t *testing.T) {
+	orchestrator := &fakeVHIVEOrchestrator{}
+	manager := &vhiveManager{orchestrator: orchestrator, snapshots: &fakeSnapshotManager{}}
+
+	manager.Shutdown()
+	manager.Shutdown()
+
+	if !reflect.DeepEqual(orchestrator.events, []string{"cleanup"}) {
+		t.Fatalf("orchestrator events = %v, want a single cleanup", orchestrator.events)
 	}
 }
 

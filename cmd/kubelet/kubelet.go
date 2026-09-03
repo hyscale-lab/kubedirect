@@ -33,6 +33,9 @@ const (
 	PodLifecycleManagerCustom = "custom"
 	nWorkers                  = 64
 	WorkloadPoolLabel         = "kubedirect/workload-pool"
+	// vmRuntimeShutdownTimeout bounds how long process shutdown waits for
+	// every tracked pod's VM to stop and its iptables rule to be removed.
+	vmRuntimeShutdownTimeout = 2 * time.Minute
 )
 
 type PendingPod struct {
@@ -528,7 +531,21 @@ func (s *KubedirectServer) ListenAndServe(ctx context.Context) error {
 		go wait.UntilWithContext(ctx, s.workerLoop, time.Second)
 	}
 
-	return s.serverHub.ListenAndServe(ctx, CustomKubeletServicePort)
+	err := s.serverHub.ListenAndServe(ctx, CustomKubeletServicePort)
+
+	// ctx is already canceled here, so every per-pod teardown below (iptables
+	// exec calls, VM stop RPCs) needs its own context that will actually let
+	// them run to completion instead of being canceled immediately.
+	if s.vmRuntime != nil {
+		kdLogger.Info("Removing pod VM network rules and stopping pod VMs")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), vmRuntimeShutdownTimeout)
+		defer cancel()
+		if shutdownErr := s.vmRuntime.shutdown(shutdownCtx); shutdownErr != nil {
+			kdLogger.Error(shutdownErr, "Failed to fully remove pod VM network rules")
+		}
+	}
+
+	return err
 }
 
 func nodeIPv4PodCIDR(node *corev1.Node) (string, error) {

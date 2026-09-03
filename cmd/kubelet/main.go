@@ -68,10 +68,11 @@ func main() {
 
 	kdServer := NewKubedirectServer(kubeClient, node).
 		WithReadyDelay(time.Duration(readyDelayMilliseconds) * time.Millisecond)
+	var manager *vhiveManager
 	if simulate {
 		kdServer.Simulate()
 	} else {
-		manager := newVHIVEManager(vhiveOpts)
+		manager = newVHIVEManager(vhiveOpts)
 		kdServer.WithVMRuntime(newPodVMRuntime(manager, iptablesRedirector{binary: "iptables"}))
 	}
 	if patch {
@@ -79,7 +80,16 @@ func main() {
 	}
 
 	klog.InfoS("Starting custom kubelet server", "node", node, "simulate", simulate, "ready-after", readyDelayMilliseconds, "patch", patch, "host-iface", vhiveOpts.hostInterface)
-	if err := kdServer.ListenAndServe(ctx); err != nil {
+	err := kdServer.ListenAndServe(ctx)
+	// ListenAndServe only returns once every pod VM has already been stopped
+	// and its iptables rule removed; only vHive's own veths/bridges/network
+	// pool are left, so clean those up regardless of how ListenAndServe
+	// returned.
+	if manager != nil {
+		klog.Info("Removing vHive network configuration")
+		manager.Shutdown()
+	}
+	if err != nil {
 		klog.Fatalf("Failed to listen & serve: %v", err)
 	}
 	klog.Info("Server stopped")

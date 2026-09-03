@@ -270,6 +270,38 @@ func (r *podVMRuntime) remove(ctx context.Context, key string) error {
 	}
 }
 
+// shutdown removes every currently tracked pod's iptables rule and stops its
+// VM. It is meant to run once, during process shutdown, after workers have
+// stopped producing new entries. ctx must not already be canceled: the
+// per-pod teardown (iptables exec.CommandContext calls, VM stop RPCs) needs
+// to actually run to completion, unlike the server's serving context which
+// is already done by the time shutdown is reached.
+func (r *podVMRuntime) shutdown(ctx context.Context) error {
+	r.mu.Lock()
+	keys := make([]string, 0, len(r.entries))
+	for key := range r.entries {
+		keys = append(keys, key)
+	}
+	r.mu.Unlock()
+
+	var mu sync.Mutex
+	var errs []error
+	var wg sync.WaitGroup
+	for _, key := range keys {
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			if err := r.remove(ctx, key); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
+		}(key)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
 type vmSpec struct {
 	image       string
 	environment []string
